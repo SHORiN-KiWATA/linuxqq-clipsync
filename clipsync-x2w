@@ -92,7 +92,7 @@ x2w() {
         # ==========================================
         echo "X2W" > "$DIR_LOCK"
         get_ms > "$TIME_LOCK"
-
+	pkill -U "$(id -u)" -x xclip 2>/dev/null
         case "$PROCESS_MODE" in
             "uri-list")
                 grep -vE '^(copy|cut)$' "$X_DATA_FILE" | sed 's|^/|file:///|' > "$CACHE_DIR/x_format.tmp"
