@@ -6,7 +6,7 @@ After=graphical-session.target
 Type=simple
 ExecStart=/usr/bin/clipsync
 Restart=always
-RestartSec=1
+RestartSec=3
 
 [Install]
 WantedBy=graphical-session.target

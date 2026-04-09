@@ -1,5 +1,28 @@
 #!/bin/bash
+export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
 
+# ==========================================
+# 动态环境嗅探 (解决 Systemd 找不到显示器的问题)
+# ==========================================
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
+# 自动获取最新创建的 Wayland Socket
+LATEST_WL=$(ls -t "$XDG_RUNTIME_DIR"/wayland-[0-9]* 2>/dev/null | head -n 1)
+if [ -n "$LATEST_WL" ]; then
+    export WAYLAND_DISPLAY=$(basename "$LATEST_WL")
+fi
+
+# 自动获取最新创建的 X11 Socket
+LATEST_X11=$(ls -t /tmp/.X11-unix/X[0-9]* 2>/dev/null | head -n 1)
+if [ -n "$LATEST_X11" ]; then
+    export DISPLAY=:$(basename "$LATEST_X11" | sed 's/X//')
+fi
+
+echo "[ClipSync] Auto-detected DISPLAY=$DISPLAY, WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+
+# ==========================================
+# 主体进程管理
+# ==========================================
 cleanup() {
     echo "[ClipSync] Stopping services..."
     kill $(jobs -p) 2>/dev/null
@@ -8,10 +31,10 @@ cleanup() {
 
 trap cleanup SIGINT SIGTERM EXIT
 
-# 1. X11 -> Wayland (守护进程)
-clipsync-x2w &
+# 1. X11 -> Wayland 
+/usr/bin/clipsync-x2w &
 
-# 2. Wayland -> X11 (监听器)
-wl-paste --watch clipsync-w2x &
+# 2. Wayland -> X11 
+/usr/bin/wl-paste --watch /usr/bin/clipsync-w2x &
 
 wait
