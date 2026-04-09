@@ -1,41 +1,62 @@
 #!/bin/bash
 export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
 
+# ==========================================
+# 动态环境嗅探 (严格正则，绝不匹配垃圾文件)
+# ==========================================
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export XAUTHORITY="$HOME/.Xauthority"
 
-LATEST_WL=$(ls -t "$XDG_RUNTIME_DIR"/wayland-[0-9]* 2>/dev/null | grep -v '\.lock$' | head -n 1)
-if [ -n "$LATEST_WL" ]; then
-    export WAYLAND_DISPLAY=$(basename "$LATEST_WL")
-fi
+export WAYLAND_DISPLAY=""
+export DISPLAY=""
 
-LATEST_X11=$(ls -t /tmp/.X11-unix/X[0-9]* 2>/dev/null | head -n 1)
-if [ -n "$LATEST_X11" ]; then
-    export DISPLAY=:$(basename "$LATEST_X11" | sed 's/X//')
-fi
+# 1. 严格嗅探 Wayland (只允许 'wayland-数字'，把后缀乱七八糟的全部干掉)
+for sock in $(ls -t "$XDG_RUNTIME_DIR" 2>/dev/null | grep -E '^wayland-[0-9]+$'); do
+    # 尝试连接，看看是不是活的
+    ERR=$(WAYLAND_DISPLAY="$sock" timeout 1s wl-paste --list-types 2>&1)
+    
+    if [[ ! "$ERR" =~ "Failed to connect" ]] && [[ ! "$ERR" =~ "No such file" ]] && [[ ! "$ERR" =~ "Connection refused" ]]; then
+        export WAYLAND_DISPLAY="$sock"
+        break
+    fi
+done
 
-echo "[ClipSync] Auto-detected DISPLAY=$DISPLAY, WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+# 2. 严格嗅探 X11 (只允许 'X数字')
+for sock in $(ls -t /tmp/.X11-unix 2>/dev/null | grep -E '^X[0-9]+$'); do
+    TEST_D=":$(echo "$sock" | sed 's/X//')"
+    ERR=$(DISPLAY="$TEST_D" timeout 1s xclip -selection clipboard -t TARGETS -o 2>&1)
+    
+    if [[ ! "$ERR" =~ "open display" ]]; then
+        export DISPLAY="$TEST_D"
+        break
+    fi
+done
+
+echo "[ClipSync] 探测结果: DISPLAY=$DISPLAY, WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+
+if [ -z "$WAYLAND_DISPLAY" ] || [ -z "$DISPLAY" ]; then
+    echo "[ClipSync] FATAL: 找不到存活的纯净图形界面，Systemd 将在 3 秒后重试..."
+    exit 1
+fi
 
 # ==========================================
 # 主体进程管理
 # ==========================================
 cleanup() {
-    echo "[ClipSync] Stopping services..."
-    # 彻底清理所有子进程
+    echo "[ClipSync] 正在清理同步子进程..."
+    # 彻底清理所有衍生的后台进程
     pkill -P $$ 2>/dev/null
     exit
 }
 
 trap cleanup SIGINT SIGTERM EXIT
 
-# 1. X11 -> Wayland 
+# 启动两个方向的同步
 /usr/bin/clipsync-x2w &
-
-# 2. Wayland -> X11 
 /usr/bin/wl-paste --watch /usr/bin/clipsync-w2x &
 
-# 使用 wait -n，只要其中任意一个进程崩溃退出，主脚本立刻退出交由 Systemd 重启
+# 只要其中任意一个进程死了，主脚本立刻自杀，触发 systemd 重启
 wait -n
 
-echo "[ClipSync] ERROR: 某个同步子进程意外死亡，正在触发重启..."
+echo "[ClipSync] ERROR: wl-paste 或 clipnotify 异常死亡，触发重启..."
 exit 1
