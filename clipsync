@@ -16,6 +16,9 @@ W_DATA_FILE="$CACHE_DIR/w_data.tmp"
 X_CHECK_FILE="$CACHE_DIR/x_check.tmp"
 W_CHECK_FILE="$CACHE_DIR/w_check.tmp"
 
+# 【关键修复】：预先创建锁文件和哈希文件，彻底消除首次启动时的 Bash 读取报错
+touch "$SYNC_STATE_LOCK" "$SYNC_HASH_FILE"
+
 EMPTY_HASH_RAW=$(printf "" | xxh128sum)
 EMPTY_HASH="${EMPTY_HASH_RAW%% *}"
 
@@ -28,7 +31,6 @@ get_ms() {
     fi
 }
 
-# 终极优化：纯 Bash 内存字符串截取，彻底消灭 cut 等外部工具调用
 calc_hash() {
     local raw_hash
     if [[ ! -s "$1" ]]; then echo "$EMPTY_HASH"; return; fi
@@ -83,16 +85,16 @@ if ! command -v clipnotify &>/dev/null; then exit 1; fi
 x2w_daemon() {
     log "INFO" "=== [X2W] 线程启动 ==="
     while clipnotify; do
-        sleep 0.03
+        sleep 0.03 
         NOW=$(get_ms)
         read -r LAST_DIR LAST_TIME < "$SYNC_STATE_LOCK" 2>/dev/null
         LAST_TIME=${LAST_TIME:-0}
-        
+
         if [[ "$LAST_DIR" == "W2X" ]] && (( NOW - LAST_TIME < 1000 )); then continue; fi
-        
+
         TYPE=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null)
         SYNC_MIME=""; PROCESS_MODE=""; SOURCE_MIME=""
-        
+
         case "$TYPE" in
             *x-special/gnome-copied-files*) SOURCE_MIME="x-special/gnome-copied-files"; SYNC_MIME="text/uri-list"; PROCESS_MODE="uri-list" ;;
             *application/x-qt-image* | *text/uri-list*) SOURCE_MIME="text/uri-list"; SYNC_MIME="text/uri-list"; PROCESS_MODE="uri-list" ;;
@@ -101,15 +103,14 @@ x2w_daemon() {
             *UTF8_STRING*) SYNC_MIME="text/plain"; SOURCE_MIME="UTF8_STRING"; PROCESS_MODE="text" ;;
             *) continue ;;
         esac
-        
+
         timeout 3s xclip -sel clip -o -t "$SOURCE_MIME" > "$X_DATA_FILE" 2>/dev/null
         CURRENT_HASH=$(calc_hash "$X_DATA_FILE" "$PROCESS_MODE")
         if [[ "$CURRENT_HASH" == "$EMPTY_HASH" ]]; then continue; fi
-        
+
         read -r LAST_SYNC < "$SYNC_HASH_FILE" 2>/dev/null
         if [[ "$CURRENT_HASH" == "$LAST_SYNC" ]]; then continue; fi
-        
-        # 吸收 Claude 建议：检测时间压榨至 0.2s，失败即放弃，杜绝任何微小卡顿
+
         timeout 0.2s wl-paste -t "$SYNC_MIME" > "$W_CHECK_FILE" 2>/dev/null
         W_HASH=$(calc_hash "$W_CHECK_FILE" "$PROCESS_MODE")
         if [[ "$CURRENT_HASH" == "$W_HASH" ]]; then
@@ -122,9 +123,9 @@ x2w_daemon() {
         
         case "$PROCESS_MODE" in
             "uri-list")
-            sed '/^\(copy\|cut\)$/d; s|^/|file:///|' "$X_DATA_FILE" | wl-copy --type text/uri-list ;;
+                sed '/^\(copy\|cut\)$/d; s|^/|file:///|' "$X_DATA_FILE" | wl-copy --type text/uri-list ;;
             "text" | "raw")
-            wl-copy -t "$SYNC_MIME" < "$X_DATA_FILE" ;;
+                wl-copy -t "$SYNC_MIME" < "$X_DATA_FILE" ;;
         esac
         [[ $? -eq 0 ]] && echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
     done
@@ -150,22 +151,22 @@ log "SYS" "双向剪贴板同步服务已准备就绪！"
 # 4. Wayland -> X11 守护 (在主进程中直接运行)
 # ==========================================
 while read -r _; do
-    sleep 0.03
-    
+    sleep 0.03 
+
     if ! kill -0 "$X2W_PID" 2>/dev/null; then
         log "ERROR" "X2W 线程意外死亡，触发重启..."
         exit 1
     fi
-    
+
     NOW=$(get_ms)
     read -r LAST_DIR LAST_TIME < "$SYNC_STATE_LOCK" 2>/dev/null
     LAST_TIME=${LAST_TIME:-0}
-    
+
     if [[ "$LAST_DIR" == "X2W" ]] && (( NOW - LAST_TIME < 1000 )); then continue; fi
-    
+
     TYPE=$(wl-paste --list-types 2>/dev/null)
     SYNC_MIME=""; PROCESS_MODE=""
-    
+
     case "$TYPE" in
         *application/x-qt-image* | *text/uri-list*) SYNC_MIME="text/uri-list"; PROCESS_MODE="uri-list" ;;
         *text/html*) SYNC_MIME="text/html"; PROCESS_MODE="raw" ;;
@@ -174,35 +175,34 @@ while read -r _; do
         *text/plain*) SYNC_MIME="text/plain"; PROCESS_MODE="text" ;;
         *) continue ;;
     esac
-    
+
     timeout 3s wl-paste -t "$SYNC_MIME" > "$W_DATA_FILE" 2>/dev/null
     CURRENT_HASH=$(calc_hash "$W_DATA_FILE" "$PROCESS_MODE")
     if [[ "$CURRENT_HASH" == "$EMPTY_HASH" ]]; then continue; fi
-    
+
     read -r LAST_SYNC < "$SYNC_HASH_FILE" 2>/dev/null
     if [[ "$CURRENT_HASH" == "$LAST_SYNC" ]]; then continue; fi
-    
-    # 吸收 Claude 建议：检测时间压榨至 0.2s
+
     timeout 0.2s xclip -sel clip -o -t "$SYNC_MIME" > "$X_CHECK_FILE" 2>/dev/null
     X_HASH=$(calc_hash "$X_CHECK_FILE" "$PROCESS_MODE")
     if [[ "$CURRENT_HASH" == "$X_HASH" ]]; then
         echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
         continue
     fi
-    
+
     log "W2X" "写入 X11... (Hash: ${CURRENT_HASH:0:8})"
     echo "W2X $(get_ms)" > "$SYNC_STATE_LOCK"
-    
+
     case "$PROCESS_MODE" in
         "uri-list")
-        sed '/^\(copy\|cut\)$/d; s|^/|file:///|' "$W_DATA_FILE" | xclip -sel clip -i -t text/uri-list ;;
+            sed '/^\(copy\|cut\)$/d; s|^/|file:///|' "$W_DATA_FILE" | xclip -sel clip -i -t text/uri-list ;;
         "text")
-        xclip -sel clip -i -t UTF8_STRING < "$W_DATA_FILE" ;;
+            xclip -sel clip -i -t UTF8_STRING < "$W_DATA_FILE" ;;
         "raw")
-        xclip -sel clip -i -t "$SYNC_MIME" < "$W_DATA_FILE" ;;
+            xclip -sel clip -i -t "$SYNC_MIME" < "$W_DATA_FILE" ;;
     esac
     [[ $? -eq 0 ]] && echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
-    
+
 done < <(wl-paste --watch echo 2>/dev/null)
 
 log "ERROR" "W2X 监听意外终止，触发重启..."
