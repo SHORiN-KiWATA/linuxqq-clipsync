@@ -4,10 +4,6 @@ Clipboard synchronization sctipts for Wayland Compositors ( X11 <--> Wayland ).
 
 WARN: Only tested on Niri and Hyprland.
 
--  Know issue
-
-    ⚠️ copy big binary data or text will somehow crash.
-
 - Dependencies
 
     `xclip` `wl-clipboard` `clipnotify`
@@ -38,22 +34,3 @@ WARN: Only tested on Niri and Hyprland.
 
     `clipsync.service` which will run `clipsync` automatically.
 
-## machanism
-
-- X11 --> Wayland
-
-    Ues `clipnotify` as trigger:
-
-    ```
-    xclip -o -sel clip -t <type> | wl-copy -t <type>
-    ```
-- Wayland --> X11
-
-    Use `wl-paste --watch` as trigger
-
-    ```
-    wl-paste -t <type> | xclip -sel clip -t <type>
-    ```
-- check
-
-    Use `md5sum` for data checking. 

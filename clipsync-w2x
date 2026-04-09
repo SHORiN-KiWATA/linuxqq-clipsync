@@ -1,184 +1,109 @@
 #!/bin/bash
 export SHELL=$(command -v bash)
-# Wayland --> X11 剪贴板同步
-sleep 0.1
+
+CACHE_DIR="/dev/shm/clipsync"
+mkdir -p "$CACHE_DIR"
+
+W_DATA_FILE="$CACHE_DIR/w_data.tmp"
+X_CHECK_FILE="$CACHE_DIR/x_check.tmp"
+DIR_LOCK="$CACHE_DIR/direction.lock"
+TIME_LOCK="$CACHE_DIR/time.lock"
+SYNC_HASH_FILE="$CACHE_DIR/last_sync.hash"
+EMPTY_HASH=$(printf "" | xxh128sum | awk '{print $1}')
+
+log() { echo "[$(date '+%H:%M:%S')] [$1] $2"; }
+get_ms() { date +%s%3N; }
 
 # ==========================================
-# 日志函数定义
+# 极限去噪哈希计算
 # ==========================================
-log() {
-    local level="$1"
-    local msg="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg"
+calc_hash() {
+    local file="$1"
+    local mode="$2"
+    if [ ! -s "$file" ]; then echo "$EMPTY_HASH"; return; fi
+    
+    if [ "$mode" == "uri-list" ]; then
+        grep -vE '^(copy|cut)$' "$file" | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}'
+    elif [ "$mode" == "text" ]; then
+        # 纯文本：强制剔除空格、制表符、换行符、空字符的干扰
+        tr -d '\0\n\r \t' < "$file" | xxh128sum | awk '{print $1}'
+    else
+        xxh128sum "$file" | awk '{print $1}'
+    fi
 }
+
 sleep 0.1
-# 空字符串的 MD5，用于检测读取失败
-EMPTY_HASH="99aa06d3014798d86001c324468d497f"
-
-log "INFO" "=== 脚本触发: 开始检测剪贴板数据类型 ==="
-
-TYPE=$(wl-paste --list-types)
-CLEAN_TYPES=$(echo "$TYPE" | tr '\n' ',' | sed 's/,$//')
-log "DEBUG" "检测到的源类型列表: [$CLEAN_TYPES]"
 
 # ==========================================
-# wechat图片 (text/uri-list x-qt-image --> text/uri-list)
+# 1. 拦截回声: 方向冷却锁 (1000毫秒)
 # ==========================================
+NOW=$(get_ms)
+LAST_DIR=$(cat "$DIR_LOCK" 2>/dev/null)
+LAST_TIME=$(cat "$TIME_LOCK" 2>/dev/null || echo 0)
 
-if [[ "$CLEAN_TYPES" =~ "application/x-qt-image" ]]; then
-    log "INFO" "匹配类型: uri-list x-qt-image"
-    
-    # 计算哈希 (两边都去掉 'file://' 前缀，忽略协议头差异)
-    W_HASH=$(wl-paste -t text/uri-list 2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-    X_HASH=$(xclip -o -sel clip -t text/uri-list  2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-    
-    if [[ "$W_HASH" == "$EMPTY_MD5" ]]; then
-        log "WARN" "Wayland 文件列表为空，跳过。"
-        exit 0
-    fi
-
-    log "DEBUG" "哈希比对 (已去头): Wayland[${W_HASH:0:8}...] vs X11[${X_HASH:0:8}...]"
-
-    if [ "$W_HASH" != "$X_HASH" ]; then
-        log "ACTION" "正在同步文件链接到 X11 (标准化为 file:// URI)..."
-        
-        # 补全 file:// 前缀
-        wl-paste -t text/uri-list | sed 's|^/|file:///|' | xclip -sel clip -t text/uri-list   
-        
-        if [ $? -eq 0 ]; then log "SUCCESS" "文件链接同步完成"; else log "ERROR" "文件链接同步失败"; fi
-    else 
-        log "SKIP" "内容重复，已跳过"
-    fi
-# ==========================================
-# 文件链接 (text/uri-list --> x-special/gnome-copied-files)
-# ==========================================
-elif [[ "$TYPE" =~ "text/uri-list" ]]; then 
-    log "INFO" "匹配类型: 文件链接 (text/uri-list)"
-    
-    # 计算哈希 (两边都去掉 'file://' 前缀，忽略协议头差异)
-    W_HASH=$(wl-paste -t text/uri-list 2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-    X_HASH=$(xclip -o -sel clip -t x-special/gnome-copied-files 2>/dev/null | tail -n +2 | sed 's|^file://||' | xxh128sum | awk '{print $1}')
-    
-    if [[ "$W_HASH" == "$EMPTY_MD5" ]]; then
-        log "WARN" "Wayland 文件列表为空，跳过。"
-        exit 0
-    fi
-
-    log "DEBUG" "哈希比对 (已去头): Wayland[${W_HASH:0:8}...] vs X11[${X_HASH:0:8}...]"
-
-    if [ "$W_HASH" != "$X_HASH" ]; then
-        log "ACTION" "正在同步文件链接到 X11 (标准化为 file:// URI)..."
-        
-        # 同步逻辑: 构造 copy 头 + 补全 file:// 前缀
-        { echo "copy"; wl-paste -t text/uri-list | sed 's|^/|file:///|'; } | xclip -sel clip -t x-special/gnome-copied-files
-        
-        if [ $? -eq 0 ]; then log "SUCCESS" "文件链接同步完成"; else log "ERROR" "文件链接同步失败"; fi
-    else 
-        log "SKIP" "内容重复，已跳过"
-    fi
-
-# ==========================================
-# QQ / HTML 富文本
-# ==========================================
-elif [[ "$TYPE" =~ "text/html" ]]; then
-    log "INFO" "匹配类型: HTML / QQ 富文本"
-
-    # 读取 Wayland (优先取 text/html)
-    W_HASH=$(timeout 1s wl-paste -t text/html 2>/dev/null | xxh128sum | awk '{print $1}')
-
-    # 防空检查
-    if [[ "$W_HASH" == "$EMPTY_MD5" ]] || [[ -z "$W_HASH" ]]; then
-        log "WARN" "读取 HTML 数据为空，跳过同步。"
-        exit 0
-    fi
-
-    # 读取 X11 对比
-    X_HASH=$(timeout 1s xclip -o -sel clip -t text/html 2>/dev/null | xxh128sum | awk '{print $1}')
-    
-    log "DEBUG" "哈希比对: Wayland[${W_HASH:0:8}...] vs X11[${X_HASH:0:8}...]"
-
-    if [[ "$W_HASH" != "$X_HASH" ]]; then
-        log "ACTION" "内容不同，正在同步 HTML 到 X11..."
-        
-        # 同步 text/html 即可兼容大多数程序
-        wl-paste -t text/html | xclip -sel clip -t text/html
-        
-        if [ $? -eq 0 ]; then log "SUCCESS" "HTML 同步完成"; else log "ERROR" "HTML 同步失败"; fi
-    else 
-        log "SKIP" "内容重复，已跳过"
-    fi
-
-# ==========================================
-# 图片 (PNG/JPEG)
-# ==========================================
-elif [[ "$TYPE" =~ "image/" ]]; then
-    log "INFO" "匹配类型: 图片 (image/*) - 智能探测"
-    
-    # --- 尝试获取数据 ---
-    
-    # 1. 优先尝试 PNG
-    TARGET_MIME="image/png"
-    log "DEBUG" "尝试读取格式: $TARGET_MIME"
-    W_HASH=$(timeout 1s wl-paste -t "$TARGET_MIME" 2>/dev/null | xxh128sum | awk '{print $1}')
-
-    # 2. 如果 PNG 读取失败，降级尝试 JPEG
-    if [[ "$W_HASH" == "$EMPTY_MD5" ]] || [[ -z "$W_HASH" ]]; then
-        log "WARN" "读取 PNG 失败，尝试降级为 JPEG..."
-        
-        TARGET_MIME="image/jpeg"
-        W_HASH=$(timeout 1s wl-paste -t "$TARGET_MIME" 2>/dev/null | xxh128sum | awk '{print $1}')
-        
-        # 3. 如果 JPEG 也失败，放弃
-        if [[ "$W_HASH" == "$EMPTY_MD5" ]] || [[ -z "$W_HASH" ]]; then
-            log "ERROR" "无法读取图片数据 (PNG/JPEG 均为空)，停止同步。"
-            exit 0
-        else
-            log "INFO" "成功切换为 JPEG 格式 ($TARGET_MIME)"
-        fi
-    fi
-
-    # --- 与 X11 对比 ---
-    
-    log "DEBUG" "正在对比 X11 中的 [$TARGET_MIME]..."
-    X_HASH=$(timeout 1s xclip -o -sel clip -t "$TARGET_MIME" 2>/dev/null | xxh128sum | awk '{print $1}')
-    
-    log "DEBUG" "哈希比对 ($TARGET_MIME): Wayland[${W_HASH:0:8}...] vs X11[${X_HASH:0:8}...]"
-
-    if [[ "$W_HASH" != "$X_HASH" ]]; then
-        log "ACTION" "内容不同，正在以 [$TARGET_MIME] 格式同步到 X11..."
-        
-        wl-paste -t "$TARGET_MIME" | xclip -sel clip -t "$TARGET_MIME"
-        
-        if [ $? -eq 0 ]; then log "SUCCESS" "图片同步完成"; else log "ERROR" "图片同步失败"; fi
-    else 
-        log "SKIP" "内容重复，已跳过"
-    fi 
-
-# ==========================================
-# 纯文字 (text/plain)
-# ==========================================
-elif [[ "$TYPE" =~ "text/plain" ]]; then 
-    log "INFO" "匹配类型: 纯文字 (text/plain)"
-    
-    W_HASH=$(wl-paste -t text/plain 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-    
-    if [[ "$W_HASH" == "$EMPTY_MD5" ]]; then
-        log "WARN" "Wayland 文本为空，跳过同步。"
-        exit 0
-    fi
-    
-    X_HASH=$(xclip -o -sel clip -t UTF8_STRING 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-
-    if [ "$W_HASH" != "$X_HASH" ]; then
-        log "ACTION" "正在同步纯文字到 X11..."
-        wl-paste | xclip -sel clip -t UTF8_STRING
-        if [ $? -eq 0 ]; then log "SUCCESS" "纯文字同步完成"; else log "ERROR" "纯文字同步失败"; fi
-    else 
-        log "SKIP" "内容重复，已跳过"
-    fi 
-
-else
-    log "WARN" "未匹配到支持的同步类型，跳过。"
+if [ "$LAST_DIR" == "X2W" ] && [ $((NOW - LAST_TIME)) -lt 1000 ]; then
+    log "IGNORE" "处于 X2W 冷却期内，丢弃回声事件。"
+    exit 0
 fi
 
-log "INFO" "--- 流程结束 ---"
+log "INFO" "=== [W2X] 检测 Wayland 剪贴板 ==="
+
+TYPE=$(wl-paste --list-types 2>/dev/null)
+SYNC_MIME=""; PROCESS_MODE=""
+
+if [[ "$TYPE" =~ "application/x-qt-image" ]] || [[ "$TYPE" =~ "text/uri-list" ]]; then
+    SYNC_MIME="text/uri-list"; PROCESS_MODE="uri-list"
+elif [[ "$TYPE" =~ "text/html" ]]; then
+    SYNC_MIME="text/html"; PROCESS_MODE="raw"
+elif [[ "$TYPE" =~ "image/png" ]]; then
+    SYNC_MIME="image/png"; PROCESS_MODE="raw"
+elif [[ "$TYPE" =~ "image/jpeg" ]]; then
+    SYNC_MIME="image/jpeg"; PROCESS_MODE="raw"
+elif [[ "$TYPE" =~ "text/plain" ]]; then
+    SYNC_MIME="text/plain"; PROCESS_MODE="text"
+else
+    exit 0
+fi
+
+timeout 3s wl-paste -t "$SYNC_MIME" > "$W_DATA_FILE" 2>/dev/null
+CURRENT_HASH=$(calc_hash "$W_DATA_FILE" "$PROCESS_MODE")
+
+if [[ "$CURRENT_HASH" == "$EMPTY_HASH" ]]; then exit 0; fi
+
+LAST_SYNC=$(cat "$SYNC_HASH_FILE" 2>/dev/null)
+if [[ "$CURRENT_HASH" == "$LAST_SYNC" ]]; then exit 0; fi
+
+timeout 1s xclip -sel clip -o -t "$SYNC_MIME" > "$X_CHECK_FILE" 2>/dev/null
+X_HASH=$(calc_hash "$X_CHECK_FILE" "$PROCESS_MODE")
+
+if [[ "$CURRENT_HASH" == "$X_HASH" ]]; then
+    log "SKIP" "X11 目标端已有相同内容，跳过。"
+    echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
+    exit 0
+fi
+
+log "ACTION" "准备写入 X11... (Hash: ${CURRENT_HASH:0:8})"
+
+# ==========================================
+# 加锁并写入
+# ==========================================
+echo "W2X" > "$DIR_LOCK"
+get_ms > "$TIME_LOCK"
+
+case "$PROCESS_MODE" in
+    "uri-list")
+        grep -vE '^(copy|cut)$' "$W_DATA_FILE" | sed 's|^/|file:///|' > "$CACHE_DIR/w_format.tmp"
+        xclip -sel clip -i -t text/uri-list < "$CACHE_DIR/w_format.tmp"
+        ;;
+    "text")
+        xclip -sel clip -i -t UTF8_STRING < "$W_DATA_FILE"
+        ;;
+    "raw")
+        xclip -sel clip -i -t "$SYNC_MIME" < "$W_DATA_FILE"
+        ;;
+esac
+
+if [ $? -eq 0 ]; then 
+    log "SUCCESS" "写入 X11 完成"
+    echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
+fi

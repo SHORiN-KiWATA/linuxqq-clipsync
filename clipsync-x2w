@@ -1,196 +1,113 @@
 #!/bin/bash
 export SHELL=$(command -v bash)
-# X11 -> Wayland剪贴板同步
-# ==========================================
-# 日志函数定义
-# ==========================================
-log() {
-    local level="$1"
-    local msg="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $msg"
+
+CACHE_DIR="/dev/shm/clipsync"
+mkdir -p "$CACHE_DIR"
+
+X_DATA_FILE="$CACHE_DIR/x_data.tmp"
+W_CHECK_FILE="$CACHE_DIR/w_check.tmp"
+DIR_LOCK="$CACHE_DIR/direction.lock"
+TIME_LOCK="$CACHE_DIR/time.lock"
+SYNC_HASH_FILE="$CACHE_DIR/last_sync.hash"
+EMPTY_HASH=$(printf "" | xxh128sum | awk '{print $1}')
+
+log() { echo "[$(date '+%H:%M:%S')] [$1] $2"; }
+get_ms() { date +%s%3N; }
+
+calc_hash() {
+    local file="$1"
+    local mode="$2"
+    if [ ! -s "$file" ]; then echo "$EMPTY_HASH"; return; fi
+    
+    if [ "$mode" == "uri-list" ]; then
+        grep -vE '^(copy|cut)$' "$file" | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}'
+    elif [ "$mode" == "text" ]; then
+        tr -d '\0\n\r \t' < "$file" | xxh128sum | awk '{print $1}'
+    else
+        xxh128sum "$file" | awk '{print $1}'
+    fi
 }
 
-# ==========================================
-# 环境检查
-# ==========================================
-if ! command -v clipnotify &>/dev/null; then
-    notify-send "clipnotify isn't installed. x11 --> wayland clipboard sync can't work properly."
-    log "ERROR" "clipnotify 未安装，脚本退出。"
-    exit 1
-fi
+if ! command -v clipnotify &>/dev/null; then exit 1; fi
 
-log "INFO" "=== 启动 X11 -> Wayland 同步守护进程 ==="
+log "INFO" "=== [X2W] X11 -> Wayland 守护进程启动 ==="
 
-# ==========================================
-# 主逻辑: 监测 X11 剪贴板变化
-# ==========================================
 x2w() {
-    # 首次启动前先进入循环
     while clipnotify; do
-    sleep 0.1 # 避免过快触发导致的竞态问题
-        log "INFO" ">>> 监测到 X11 剪贴板变化信号"
-        
-        # 获取剪贴板中的数据类型
-        TYPE=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null)
-        
-        # 格式化以便日志显示
-        CLEAN_TYPES=$(echo "$TYPE" | tr '\n' ',' | sed 's/,$//')
-        log "DEBUG" "X11 包含的数据类型: [$CLEAN_TYPES]"
+        sleep 0.1 
 
+        # ==========================================
+        # 拦截回声: 方向冷却锁
+        # ==========================================
+        NOW=$(get_ms)
+        LAST_DIR=$(cat "$DIR_LOCK" 2>/dev/null)
+        LAST_TIME=$(cat "$TIME_LOCK" 2>/dev/null || echo 0)
 
-        # ---------------------------------------------------------
-        # wechat图片 (text/uri-list x-qt-image --> text/uri-list)
-        # ---------------------------------------------------------
-        if [[ "$TYPE" =~ "text/uri-list" ]] && [[ "$TYPE" =~ "application/x-qt-image" ]]; then
-            log "INFO" "匹配类型: x-qt-image"
-            
-            # 计算 Wayland 哈希 (去掉 file:// 前缀)
-            W_HASH=$(wl-paste -t text/uri-list 2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            X_HASH=$(xclip -o -sel clip -t text/uri-list  2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            
-            log "DEBUG" "哈希比对(去头): Wayland[$W_HASH] vs X11[$X_HASH]"
-
-            if [ "$W_HASH" != "$X_HASH" ]; then
-                log "ACTION" "文件列表不同，正在同步到 Wayland (标准化 URI)..."
-                
-                # 同步时：确保加上 file:// 前缀
-                xclip -sel clip -o -t text/uri-list | tail -n +2 | wl-copy --type text/uri-list
-                
-                if [ $? -eq 0 ]; then 
-                    log "SUCCESS" "文件列表同步成功"
-                else 
-                    log "ERROR" "文件列表同步失败"
-                fi
-
-                continue
-
-            else
-                log "SKIP" "文件列表一致，跳过同步"
-            fi
-        # ---------------------------------------------------------
-        # QQ 表情包 /图片
-        # ---------------------------------------------------------
-        elif [[ "$TYPE" =~ "x-special/gnome-copied-files" ]] && [[ "$TYPE" =~ "QQ_Unicode_RichEdit_Format" ]] && [[ "$TYPE" =~ "image/png" ]]; then
-            log "INFO" "匹配类型: QQ_Unicode_RichEdit_Format"
-            
-            # 计算 Wayland 哈希 (去掉 file:// 前缀)
-            W_HASH=$(wl-paste -t text/uri-list 2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            
-            # 计算 X11 哈希 (去掉第一行，去掉 file:// 前缀)
-            X_HASH=$(xclip -o -sel clip -t x-special/gnome-copied-files 2>/dev/null | tail -n +2 | sed 's|^file://||' | tr -d '\n\r'| xxh128sum | awk '{print $1}')
-            
-            log "DEBUG" "哈希比对(去头): Wayland[$W_HASH] vs X11[$X_HASH]"
-
-            if [ "$W_HASH" != "$X_HASH" ]; then
-                log "ACTION" "文件列表不同，正在同步到 Wayland (标准化 URI)..."
-                
-                # 同步时：确保加上 file:// 前缀
-                xclip -sel clip -o -t x-special/gnome-copied-files | tail -n +2 | sed 's|^/|file:///|' | wl-copy --type text/uri-list
-                
-                if [ $? -eq 0 ]; then 
-                    log "SUCCESS" "文件列表同步成功"
-                else 
-                    log "ERROR" "文件列表同步失败"
-                fi
-
-                continue
-
-            else
-                log "SKIP" "文件列表一致，跳过同步"
-            fi
-
-        # ---------------------------------------------------------
-        #  图片 (image/png)
-        # ---------------------------------------------------------
-        elif [[ "$TYPE" =~ "image/png" ]]; then
-            log "INFO" "匹配类型: PNG 图片 (image/png)"
-            
-            W_HASH=$(wl-paste -t image/png 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            X_HASH=$(xclip -o -sel clip -t image/png 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            
-            log "DEBUG" "哈希比对: Wayland[$W_HASH] vs X11[$X_HASH]"
-
-            if [ "$W_HASH" != "$X_HASH" ]; then
-                log "ACTION" "图片内容不同，正在同步到 Wayland..."
-                xclip -sel clip -o -t image/png | wl-copy -t image/png
-                if [ $? -eq 0 ]; then log "SUCCESS" "图片同步成功"; else log "ERROR" "图片同步失败"; fi
-                continue
-            else
-                log "SKIP" "图片内容一致，跳过同步"
-            fi
-
-        # ---------------------------------------------------------
-        #  图片 (image/jpeg)
-        # ---------------------------------------------------------
-        elif [[ "$TYPE" =~ "image/jpeg" ]]; then
-            log "INFO" "匹配类型: JPEG图片 (image/jpeg)"
-            
-            W_HASH=$(wl-paste -t image/jpeg 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            X_HASH=$(xclip -o -sel clip -t image/jpeg 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            
-            log "DEBUG" "哈希比对: Wayland[$W_HASH] vs X11[$X_HASH]"
-
-            if [ "$W_HASH" != "$X_HASH" ]; then
-                log "ACTION" "图片内容不同，正在同步到 Wayland..."
-                xclip -sel clip -o -t image/jpeg | wl-copy -t image/jpeg
-                if [ $? -eq 0 ]; then log "SUCCESS" "图片同步成功"; else log "ERROR" "图片同步失败"; fi
-                continue
-            else
-                log "SKIP" "图片内容一致，跳过同步"
-            fi
-
-        # ---------------------------------------------------------
-        # 文件链接 (gnome-copied-files)
-        # ---------------------------------------------------------
-        elif [[ "$TYPE" =~ "x-special/gnome-copied-files" ]]; then
-            log "INFO" "匹配类型: 文件列表 (gnome-copied-files)"
-            
-            # 计算 Wayland 哈希 (去掉 file:// 前缀)
-            W_HASH=$(wl-paste -t text/uri-list 2>/dev/null | sed 's|^file://||' | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            
-            # 计算 X11 哈希 (去掉第一行，去掉 file:// 前缀)
-            X_HASH=$(xclip -o -sel clip -t x-special/gnome-copied-files 2>/dev/null | tail -n +2 | sed 's|^file://||' | tr -d '\n\r'| xxh128sum | awk '{print $1}')
-            
-            log "DEBUG" "哈希比对(去头): Wayland[$W_HASH] vs X11[$X_HASH]"
-
-            if [ "$W_HASH" != "$X_HASH" ]; then
-                log "ACTION" "文件列表不同，正在同步到 Wayland (标准化 URI)..."
-                
-                # 同步时：确保加上 file:// 前缀
-                xclip -sel clip -o -t x-special/gnome-copied-files | tail -n +2 | sed 's|^/|file:///|' | wl-copy --type text/uri-list
-                
-                if [ $? -eq 0 ]; then log "SUCCESS" "文件列表同步成功"; else log "ERROR" "文件列表同步失败"; fi
-                continue
-            else
-                log "SKIP" "文件列表一致，跳过同步"
-            fi
-
-        # ---------------------------------------------------------
-        # 纯文字 (UTF8_STRING)
-        # ---------------------------------------------------------
-        elif [[ "$TYPE" =~ "UTF8_STRING" ]]; then
-            log "INFO" "匹配类型: 纯文字 (UTF8_STRING)"
-            
-            W_HASH=$(wl-paste 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            X_HASH=$(xclip -o -sel clip -t UTF8_STRING 2>/dev/null | tr -d '\n\r' | xxh128sum | awk '{print $1}')
-            
-            log "DEBUG" "哈希比对: Wayland[$W_HASH] vs X11[$X_HASH]"
-
-            if [ "$W_HASH" != "$X_HASH" ]; then
-                log "ACTION" "内容不同，正在同步到 Wayland..."
-                xclip -sel clip -o -t UTF8_STRING | wl-copy -t UTF8_STRING
-                if [ $? -eq 0 ]; then log "SUCCESS" "纯文字同步成功"; else log "ERROR" "纯文字同步失败"; fi
-                continue
-            else
-                log "SKIP" "内容一致，跳过同步"
-            fi
-        else
-            log "WARN" "未匹配到支持的同步类型，忽略。"
+        if [ "$LAST_DIR" == "W2X" ] && [ $((NOW - LAST_TIME)) -lt 1000 ]; then
+            log "IGNORE" "处于 W2X 冷却期内，丢弃回声事件。"
+            continue
         fi
-        
-        log "INFO" "--- 本次循环结束，等待下一次 clipnotify 信号 ---"
+
+        TYPE=$(xclip -selection clipboard -t TARGETS -o 2>/dev/null)
+        SYNC_MIME=""; PROCESS_MODE=""; SOURCE_MIME=""
+
+        if [[ "$TYPE" =~ "application/x-qt-image" ]] || [[ "$TYPE" =~ "x-special/gnome-copied-files" ]] || [[ "$TYPE" =~ "text/uri-list" ]]; then
+            if [[ "$TYPE" =~ "x-special/gnome-copied-files" ]]; then
+                SOURCE_MIME="x-special/gnome-copied-files"
+            else
+                SOURCE_MIME="text/uri-list"
+            fi
+            SYNC_MIME="text/uri-list"; PROCESS_MODE="uri-list"
+        elif [[ "$TYPE" =~ "image/png" ]]; then
+            SYNC_MIME="image/png"; SOURCE_MIME="image/png"; PROCESS_MODE="raw"
+        elif [[ "$TYPE" =~ "image/jpeg" ]]; then
+            SYNC_MIME="image/jpeg"; SOURCE_MIME="image/jpeg"; PROCESS_MODE="raw"
+        elif [[ "$TYPE" =~ "UTF8_STRING" ]]; then
+            SYNC_MIME="text/plain"; SOURCE_MIME="UTF8_STRING"; PROCESS_MODE="text"
+        else
+            continue
+        fi
+
+        timeout 3s xclip -sel clip -o -t "$SOURCE_MIME" > "$X_DATA_FILE" 2>/dev/null
+        CURRENT_HASH=$(calc_hash "$X_DATA_FILE" "$PROCESS_MODE")
+
+        if [[ "$CURRENT_HASH" == "$EMPTY_HASH" ]]; then continue; fi
+
+        LAST_SYNC=$(cat "$SYNC_HASH_FILE" 2>/dev/null)
+        if [[ "$CURRENT_HASH" == "$LAST_SYNC" ]]; then continue; fi
+
+        timeout 1s wl-paste -t "$SYNC_MIME" > "$W_CHECK_FILE" 2>/dev/null
+        W_HASH=$(calc_hash "$W_CHECK_FILE" "$PROCESS_MODE")
+
+        if [[ "$CURRENT_HASH" == "$W_HASH" ]]; then
+            log "SKIP" "Wayland 目标端已有相同内容，跳过。"
+            echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
+            continue
+        fi
+
+        log "ACTION" "准备写入 Wayland... (Hash: ${CURRENT_HASH:0:8})"
+
+        # ==========================================
+        # 加锁并写入
+        # ==========================================
+        echo "X2W" > "$DIR_LOCK"
+        get_ms > "$TIME_LOCK"
+
+        case "$PROCESS_MODE" in
+            "uri-list")
+                grep -vE '^(copy|cut)$' "$X_DATA_FILE" | sed 's|^/|file:///|' > "$CACHE_DIR/x_format.tmp"
+                wl-copy --type text/uri-list < "$CACHE_DIR/x_format.tmp"
+                ;;
+            "text" | "raw")
+                wl-copy -t "$SYNC_MIME" < "$X_DATA_FILE"
+                ;;
+        esac
+
+        if [ $? -eq 0 ]; then 
+            log "SUCCESS" "写入 Wayland 完成"
+            echo "$CURRENT_HASH" > "$SYNC_HASH_FILE"
+        fi
     done
 }
 
-# 执行
 x2w
