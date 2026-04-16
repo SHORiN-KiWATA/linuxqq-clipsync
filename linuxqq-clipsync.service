@@ -4,7 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/clipsync
+ExecStart=/usr/bin/linuxqq-clipsync
 Restart=always
 RestartSec=3
 

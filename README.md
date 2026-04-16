@@ -1,24 +1,22 @@
-# Clipsync
+# Linuxqq-Clipsync
 
-Clipboard synchronization sctipts for Wayland Compositors ( X11 <--> Wayland ).
+通过同步 X11 和 Wayland 剪贴板的方式修复 Linuxqq 以 Wayland 运行时的剪贴板异常。
 
-- Dependencies
+- 依赖
 
     `xclip` `wl-clipboard` `clipnotify`
 
-- Installation
+- 安装
 
     ```
-    yay -S clipsync-git
+    yay -S linuxqq-clipsync-git
     ```
 
-- Usage
+- 使用
 
-    run `clipsync` command or use systemd 
+    运行`linuxqq-clipsync`命令即可，但是更推荐使用systemd服务。 
     
     ```
-    systemctl enable --user clipsync
+    systemctl enable --user linuxqq-clipsync
     ```
-
-    It's also recommend to use my clipboard tui with this scrtip:[shorinclip](https://github.com/SHORiN-KiWATA/shorinclip)
 
