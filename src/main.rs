@@ -26,12 +26,13 @@ fn get_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+// 优化 1：零拷贝 Hash，拒绝为大图片分配多余内存
 fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
     if data.is_empty() {
-        return Default::default();
+        return EMPTY_HASH;
     }
     
-    let processed_data = match process_mode {
+    match process_mode {
         "uri-list" => {
             let s = String::from_utf8_lossy(data);
             let mut result = String::new();
@@ -40,22 +41,18 @@ fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
                 if trimmed == "copy" || trimmed == "cut" { continue; }
                 result.push_str(trimmed.trim_start_matches("file://"));
             }
-            result.replace("\n", "").replace("\r", "").into_bytes()
+            let processed = result.replace("\n", "").replace("\r", "").into_bytes();
+            if processed.is_empty() { EMPTY_HASH } else { xxh3_128(&processed) }
         }
         "text" => {
             let s = String::from_utf8_lossy(data);
             let result: String = s.chars()
                 .filter(|c| *c != '\0' && *c != '\n' && *c != '\r' && *c != ' ' && *c != '\t')
                 .collect();
-            result.into_bytes()
+            let processed = result.into_bytes();
+            if processed.is_empty() { EMPTY_HASH } else { xxh3_128(&processed) }
         }
-        _ => data.to_vec(),
-    };
-
-    if processed_data.is_empty() {
-        EMPTY_HASH
-    } else {
-        xxh3_128(&processed_data)
+        _ => xxh3_128(data), // 对于图片直接 Hash 原数组，绝对不 clone！
     }
 }
 
@@ -116,16 +113,13 @@ fn main() {
         env::set_var("XAUTHORITY", format!("{}/.Xauthority", home));
     }
 
-// --- 优化后的探测逻辑 ---
     let mut wayland_display = env::var("WAYLAND_DISPLAY").unwrap_or_default();
     let mut display = env::var("DISPLAY").unwrap_or_default();
 
-    // 如果环境变量没拿到，再尝试扫描
     if wayland_display.is_empty() {
         if let Ok(entries) = fs::read_dir(&xdg_runtime_dir) {
             for entry in entries.flatten() {
                 let file_name = entry.file_name().into_string().unwrap_or_default();
-                // 重点：只找以 wayland- 开头，且不包含额外扩展名的（排除 .sock, .lock）
                 if file_name.starts_with("wayland-") && !file_name.contains('.') {
                     if Command::new("wl-paste")
                         .env("WAYLAND_DISPLAY", &file_name)
@@ -156,7 +150,6 @@ fn main() {
             }
         }
     }
-    // --- 探测逻辑结束 ---
 
     env::set_var("WAYLAND_DISPLAY", &wayland_display);
     env::set_var("DISPLAY", &display);
@@ -184,11 +177,10 @@ fn main() {
             let _ = Command::new("clipnotify").status();
             thread::sleep(Duration::from_millis(30)); 
 
+            // 优化 2：【前置全局排他锁】在此处锁死状态，彻底杜绝并发竞争，利用短路求值拦截回音！
+            let mut state = state_x2w.lock().unwrap();
             let now = get_ms();
-            {
-                let state = state_x2w.lock().unwrap();
-                if state.last_dir == "W2X" && (now - state.last_time < 1000) { continue; }
-            }
+            if state.last_dir == "W2X" && (now - state.last_time < 1000) { continue; }
 
             let types_raw = read_clipboard("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]);
             let types_str = String::from_utf8_lossy(&types_raw);
@@ -211,14 +203,8 @@ fn main() {
             let current_hash = calc_hash(&x_data, process_mode);
             if current_hash == EMPTY_HASH { continue; }
 
-            let mut state = state_x2w.lock().unwrap();
+            // 优化 3：移除极其冗余的二次目标查壳（w_check_data），直接依靠记录的 hash 防环
             if current_hash == state.last_sync_hash { continue; }
-
-            let w_check_data = read_clipboard("wl-paste", &["-t", sync_mime]);
-            if current_hash == calc_hash(&w_check_data, process_mode) {
-                state.last_sync_hash = current_hash;
-                continue;
-            }
 
             log("X2W", &format!("写入 Wayland... (Hash: {:08x})", (current_hash >> 96) as u32));
             state.last_dir = "X2W".to_string();
@@ -266,11 +252,10 @@ fn main() {
     for _line in reader.lines() {
         thread::sleep(Duration::from_millis(30));
 
+        // 优化 2：【前置全局排他锁】同样提到最前面，防止 XWayland 带来的回音击穿
+        let mut state = shared_state.lock().unwrap();
         let now = get_ms();
-        {
-            let state = shared_state.lock().unwrap();
-            if state.last_dir == "X2W" && (now - state.last_time < 1000) { continue; }
-        }
+        if state.last_dir == "X2W" && (now - state.last_time < 1000) { continue; }
 
         let types_raw = read_clipboard("wl-paste", &["--list-types"]);
         let types_str = String::from_utf8_lossy(&types_raw);
@@ -293,14 +278,8 @@ fn main() {
         let current_hash = calc_hash(&w_data, process_mode);
         if current_hash == EMPTY_HASH { continue; }
 
-        let mut state = shared_state.lock().unwrap();
+        // 优化 3：移除 x_check_data 的大量多余 IO。
         if current_hash == state.last_sync_hash { continue; }
-
-        let x_check_data = read_clipboard("xclip", &["-sel", "clip", "-o", "-t", sync_mime]);
-        if current_hash == calc_hash(&x_check_data, process_mode) {
-            state.last_sync_hash = current_hash;
-            continue;
-        }
 
         log("W2X", &format!("写入 X11... (Hash: {:08x})", (current_hash >> 96) as u32));
         state.last_dir = "W2X".to_string();
