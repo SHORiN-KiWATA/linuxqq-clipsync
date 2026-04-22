@@ -226,14 +226,16 @@ fn main() {
                     || types_str.contains("text/uri-list")
                 {
                     ("text/uri-list", "text/uri-list", "uri-list")
-                } else if types_str.contains("text/html") {
-                    ("text/html", "text/html", "raw")
                 } else if types_str.contains("image/png") {
                     ("image/png", "image/png", "raw")
                 } else if types_str.contains("image/jpeg") {
                     ("image/jpeg", "image/jpeg", "raw")
                 } else if types_str.contains("UTF8_STRING") {
                     ("UTF8_STRING", "text/plain", "text")
+                } else if types_str.contains("text/plain") {
+                    ("text/plain", "text/plain", "text")
+                } else if types_str.contains("text/html") {
+                    ("text/html", "text/html", "raw")
                 } else {
                     continue;
                 };
@@ -317,14 +319,14 @@ fn main() {
             || types_str.contains("text/uri-list")
         {
             ("text/uri-list", "uri-list")
-        } else if types_str.contains("text/html") {
-            ("text/html", "raw")
         } else if types_str.contains("image/png") {
             ("image/png", "raw")
         } else if types_str.contains("image/jpeg") {
             ("image/jpeg", "raw")
         } else if types_str.contains("text/plain") {
             ("text/plain", "text")
+        } else if types_str.contains("text/html") {
+            ("text/html", "raw")
         } else {
             continue;
         };
