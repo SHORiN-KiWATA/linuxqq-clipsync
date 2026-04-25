@@ -230,6 +230,8 @@ fn main() {
                     ("image/png", "image/png", "raw")
                 } else if types_str.contains("image/jpeg") {
                     ("image/jpeg", "image/jpeg", "raw")
+                } else if types_str.contains("text/plain;charset=utf-8") {
+                    ("text/plain;charset=utf-8", "text/plain", "text") 
                 } else if types_str.contains("UTF8_STRING") {
                     ("UTF8_STRING", "text/plain", "text")
                 } else if types_str.contains("text/plain") {
