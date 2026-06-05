@@ -130,8 +130,13 @@ fn main() {
     let xdg_runtime_dir = get_xdg_runtime_dir();
     env::set_var("XDG_RUNTIME_DIR", &xdg_runtime_dir);
 
-    if let Ok(home) = env::var("HOME") {
-        env::set_var("XAUTHORITY", format!("{}/.Xauthority", home));
+    if env::var("XAUTHORITY").is_err() {
+        if let Ok(home) = env::var("HOME") {
+            let candidate = format!("{}/.Xauthority", home);
+            if std::path::Path::new(&candidate).exists() {
+                env::set_var("XAUTHORITY", candidate);
+            }
+        }
     }
 
     let mut wayland_display = env::var("WAYLAND_DISPLAY").unwrap_or_default();
