@@ -340,7 +340,7 @@ fn main() {
             continue;
         };
 
-        let w_data = read_clipboard("wl-paste", &["-t", sync_mime]);
+        let w_data = read_clipboard("wl-paste", &["-n", "-t", sync_mime]);
         let current_hash = calc_hash(&w_data, process_mode);
         if current_hash == EMPTY_HASH {
             continue;
