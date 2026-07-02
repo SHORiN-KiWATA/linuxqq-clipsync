@@ -1,8 +1,7 @@
 use chrono::Utc;
-use memfd::MemfdOptions;
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
@@ -137,55 +136,41 @@ fn calc_hash(data: &[u8], process_mode: ProcessMode) -> Option<u128> {
 }
 
 // ==========================================
-// 核心机制：无管道读取与写入 (基于 memfd)
+// 剪贴板读写（子进程 + 标准管道）
 // ==========================================
 
 fn read_clipboard(cmd: &Cmd, mime: Option<&str>) -> Vec<u8> {
-    let Ok(mfd) = MemfdOptions::default().create("clip_read") else {
-        return vec![];
-    };
-    let file = mfd.into_file();
-    let Ok(file_out) = file.try_clone() else {
-        return vec![];
-    };
-
-    if let Ok(mut child) = cmd
-        .command(mime)
-        .stdout(Stdio::from(file_out))
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        let _ = child.wait();
+    // 退出码刻意忽略：xclip/wl-paste 在无对应类型时非零退出属正常，
+    // 此时 stdout 为空，交由上层按空数据处理。
+    match cmd.command(mime).stderr(Stdio::null()).output() {
+        Ok(out) => out.stdout,
+        Err(e) => {
+            log("WARN", &format!("启动 {} 失败: {e}", cmd.program));
+            vec![]
+        }
     }
-
-    let mut data = Vec::new();
-    let mut file_read = file;
-    let _ = file_read.seek(SeekFrom::Start(0));
-    let _ = file_read.read_to_end(&mut data);
-    data
 }
 
 fn write_clipboard(cmd: &Cmd, mime: &str, data: &[u8]) -> bool {
-    let Ok(mfd) = MemfdOptions::default().create("clip_write") else {
-        return false;
-    };
-    let mut file = mfd.into_file();
-    if file.write_all(data).is_err() {
-        return false;
-    }
-    if file.seek(SeekFrom::Start(0)).is_err() {
-        return false;
-    }
-
-    if let Ok(mut child) = cmd
+    let mut child = match cmd
         .command(Some(mime))
-        .stdin(Stdio::from(file))
+        .stdin(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
     {
-        return child.wait().map(|s| s.success()).unwrap_or(false);
+        Ok(c) => c,
+        Err(e) => {
+            log("WARN", &format!("启动 {} 失败: {e}", cmd.program));
+            return false;
+        }
+    };
+    // 语句结束即 drop stdin 关闭写端，wait 不会挂起
+    if let Err(e) = child.stdin.take().expect("stdin was piped").write_all(data) {
+        log("WARN", &format!("写入 {} stdin 失败: {e}", cmd.program));
+        let _ = child.wait();
+        return false;
     }
-    false
+    child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
 // uri-list 规范化：丢弃 copy/cut 行，裸路径补成 file:/// 形式
