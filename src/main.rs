@@ -1,4 +1,3 @@
-use chrono::Utc;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -86,9 +85,10 @@ struct SyncConfig {
     write: Cmd,
 }
 
+// 不带时间戳：推荐的运行方式是 systemd 服务，journald 自带（本地时区的）时间戳；
+// 此前 chrono 打的 UTC 时间反而误导。
 fn log(level: &str, msg: &str) {
-    let now = Utc::now().format("%H:%M:%S").to_string();
-    println!("[{}] [{}] {}", now, level, msg);
+    println!("[{level}] {msg}");
 }
 
 // 回音窗口阈值：刚被对向写入 1 秒内的变化视为回音，忽略
