@@ -94,7 +94,8 @@ fn log(level: &str, msg: &str) {
 // 回音窗口阈值：刚被对向写入 1 秒内的变化视为回音，忽略
 const ECHO_WINDOW: Duration = Duration::from_secs(1);
 
-// 优化 1：零拷贝 Hash，拒绝为大图片分配多余内存
+// 归一化后 Hash：抹平同一内容在两侧的表示差异，供防环去重。
+// Raw（图片等大块数据）直接 Hash 原切片，零分配。
 fn calc_hash(data: &[u8], process_mode: ProcessMode) -> Option<u128> {
     if data.is_empty() {
         return None;
@@ -111,27 +112,25 @@ fn calc_hash(data: &[u8], process_mode: ProcessMode) -> Option<u128> {
                 }
                 result.push_str(trimmed.trim_start_matches("file://"));
             }
-            let processed = result.replace("\n", "").replace("\r", "").into_bytes();
-            if processed.is_empty() {
+            if result.is_empty() {
                 None
             } else {
-                Some(xxh3_128(&processed))
+                Some(xxh3_128(result.as_bytes()))
             }
         }
         ProcessMode::Text => {
             let s = String::from_utf8_lossy(data);
-            let result: String = s
-                .chars()
-                .filter(|c| *c != '\0' && *c != '\n' && *c != '\r' && *c != ' ' && *c != '\t')
-                .collect();
-            let processed = result.into_bytes();
+            // 仅抹平表示差异：\0 填充、CRLF/LF、首尾空白。内容中间的空白是
+            // 有效变更，不再整体过滤（此前 "a b" → "ab" 会被误判为重复而丢弃）。
+            let cleaned: String = s.chars().filter(|c| *c != '\0' && *c != '\r').collect();
+            let processed = cleaned.trim();
             if processed.is_empty() {
                 None
             } else {
-                Some(xxh3_128(&processed))
+                Some(xxh3_128(processed.as_bytes()))
             }
         }
-        ProcessMode::Raw => Some(xxh3_128(data)), // 对于图片直接 Hash 原数组，绝对不 clone！
+        ProcessMode::Raw => Some(xxh3_128(data)),
     }
 }
 
