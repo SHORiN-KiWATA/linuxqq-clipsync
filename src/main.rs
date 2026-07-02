@@ -276,16 +276,17 @@ fn handle_change(state: &Mutex<SyncState>, cfg: &SyncConfig) {
             (current_hash >> 96) as u32
         ),
     );
-    st.last_dir = Some(cfg.dir);
-    st.last_time = Some(Instant::now());
-
     let payload = if mode == ProcessMode::UriList {
         rewrite_uri_list(&data)
     } else {
         data
     };
 
+    // 锁全程持有，对向的回音事件在写入期间阻塞在锁外，因此状态在写成功后
+    // 置位依然先于任何回音被处理；写失败则不占用回音窗，不再无谓压制对向 1 秒。
     if (cfg.write_data)(write_type, &payload) {
+        st.last_dir = Some(cfg.dir);
+        st.last_time = Some(Instant::now());
         st.last_sync_hash = Some(current_hash);
     }
 }
