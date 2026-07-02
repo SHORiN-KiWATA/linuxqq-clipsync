@@ -3,6 +3,7 @@ use memfd::MemfdOptions;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -53,16 +54,37 @@ struct SyncState {
     last_sync_hash: Option<u128>,
 }
 
-// 一个同步方向的注入配置：触发差异全部收敛到函数指针，循环体共用 handle_change。
+// 一条外部命令的完整描述：程序、固定参数（MIME 类型统一追加在末尾）、
+// 以及目标显示所需的环境变量。环境逐命令显式注入，不再用 env::set_var
+// 篡改进程全局环境（edition 2024 起 set_var 也将是 unsafe）。
+#[derive(Clone)]
+struct Cmd {
+    program: &'static str,
+    args: &'static [&'static str],
+    env: Arc<Vec<(&'static str, String)>>,
+}
+
+impl Cmd {
+    fn command(&self, mime: Option<&str>) -> Command {
+        let mut c = Command::new(self.program);
+        c.args(self.args);
+        if let Some(t) = mime {
+            c.arg(t);
+        }
+        c.envs(self.env.iter().map(|(k, v)| (*k, v.as_str())));
+        c
+    }
+}
+
+// 一个同步方向的注入配置：触发差异全部收敛为数据，循环体共用 handle_change。
 // pick 返回 (读取类型, 写入类型, 处理模式)；两个方向各自的 MIME 表保留，因为源/目标
 // 表示本就不对称（X 侧特有 gnome-copied-files / UTF8_STRING 源类型等）。
-#[derive(Clone, Copy)]
 struct SyncConfig {
     dir: Direction,
-    list_types: fn() -> Vec<u8>,
     pick: fn(&str) -> Option<(&'static str, &'static str, ProcessMode)>,
-    read_data: fn(&str) -> Vec<u8>,
-    write_data: fn(&str, &[u8]) -> bool,
+    list: Cmd,
+    read: Cmd,
+    write: Cmd,
 }
 
 fn log(level: &str, msg: &str) {
@@ -118,7 +140,7 @@ fn calc_hash(data: &[u8], process_mode: ProcessMode) -> Option<u128> {
 // 核心机制：无管道读取与写入 (基于 memfd)
 // ==========================================
 
-fn read_clipboard(cmd: &str, args: &[&str]) -> Vec<u8> {
+fn read_clipboard(cmd: &Cmd, mime: Option<&str>) -> Vec<u8> {
     let Ok(mfd) = MemfdOptions::default().create("clip_read") else {
         return vec![];
     };
@@ -127,8 +149,8 @@ fn read_clipboard(cmd: &str, args: &[&str]) -> Vec<u8> {
         return vec![];
     };
 
-    if let Ok(mut child) = Command::new(cmd)
-        .args(args)
+    if let Ok(mut child) = cmd
+        .command(mime)
         .stdout(Stdio::from(file_out))
         .stderr(Stdio::null())
         .spawn()
@@ -143,7 +165,7 @@ fn read_clipboard(cmd: &str, args: &[&str]) -> Vec<u8> {
     data
 }
 
-fn write_clipboard(cmd: &str, args: &[&str], data: &[u8]) -> bool {
+fn write_clipboard(cmd: &Cmd, mime: &str, data: &[u8]) -> bool {
     let Ok(mfd) = MemfdOptions::default().create("clip_write") else {
         return false;
     };
@@ -155,8 +177,8 @@ fn write_clipboard(cmd: &str, args: &[&str], data: &[u8]) -> bool {
         return false;
     }
 
-    if let Ok(mut child) = Command::new(cmd)
-        .args(args)
+    if let Ok(mut child) = cmd
+        .command(Some(mime))
         .stdin(Stdio::from(file))
         .stderr(Stdio::null())
         .spawn()
@@ -252,13 +274,13 @@ fn handle_change(state: &Mutex<SyncState>, cfg: &SyncConfig) {
         return;
     }
 
-    let types_raw = (cfg.list_types)();
+    let types_raw = read_clipboard(&cfg.list, None);
     let types_str = String::from_utf8_lossy(&types_raw);
     let Some((read_type, write_type, mode)) = (cfg.pick)(&types_str) else {
         return;
     };
 
-    let data = (cfg.read_data)(read_type);
+    let data = read_clipboard(&cfg.read, Some(read_type));
     let Some(current_hash) = calc_hash(&data, mode) else {
         return;
     };
@@ -284,7 +306,7 @@ fn handle_change(state: &Mutex<SyncState>, cfg: &SyncConfig) {
 
     // 锁全程持有，对向的回音事件在写入期间阻塞在锁外，因此状态在写成功后
     // 置位依然先于任何回音被处理；写失败则不占用回音窗，不再无谓压制对向 1 秒。
-    if (cfg.write_data)(write_type, &payload) {
+    if write_clipboard(&cfg.write, write_type, &payload) {
         st.last_dir = Some(cfg.dir);
         st.last_time = Some(Instant::now());
         st.last_sync_hash = Some(current_hash);
@@ -311,21 +333,13 @@ fn get_xdg_runtime_dir() -> String {
     if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
         return dir;
     }
-    format!("/run/user/{}", unsafe { libc::getuid() })
+    // /proc/self 的属主即本进程 uid，免去 libc::getuid
+    let uid = fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0);
+    format!("/run/user/{uid}")
 }
 
 fn main() {
     let xdg_runtime_dir = get_xdg_runtime_dir();
-    env::set_var("XDG_RUNTIME_DIR", &xdg_runtime_dir);
-
-    if env::var("XAUTHORITY").is_err() {
-        if let Ok(home) = env::var("HOME") {
-            let candidate = format!("{}/.Xauthority", home);
-            if std::path::Path::new(&candidate).exists() {
-                env::set_var("XAUTHORITY", candidate);
-            }
-        }
-    }
 
     let mut wayland_display = env::var("WAYLAND_DISPLAY").unwrap_or_default();
     let mut display = env::var("DISPLAY").unwrap_or_default();
@@ -344,9 +358,6 @@ fn main() {
         .unwrap_or_default();
     }
 
-    env::set_var("WAYLAND_DISPLAY", &wayland_display);
-    env::set_var("DISPLAY", &display);
-
     log(
         "INIT",
         &format!(
@@ -360,6 +371,23 @@ fn main() {
         std::process::exit(1);
     }
 
+    // 两侧显示所需的环境，注入到各自的子进程；XAUTHORITY 仅在环境缺失
+    // 且 ~/.Xauthority 存在时补上（环境已有则子进程自然继承）。
+    let mut x_env = vec![("DISPLAY", display)];
+    if env::var("XAUTHORITY").is_err() {
+        if let Ok(home) = env::var("HOME") {
+            let candidate = format!("{home}/.Xauthority");
+            if std::path::Path::new(&candidate).exists() {
+                x_env.push(("XAUTHORITY", candidate));
+            }
+        }
+    }
+    let x_env = Arc::new(x_env);
+    let w_env = Arc::new(vec![
+        ("WAYLAND_DISPLAY", wayland_display),
+        ("XDG_RUNTIME_DIR", xdg_runtime_dir),
+    ]);
+
     let shared_state = Arc::new(Mutex::new(SyncState {
         last_dir: None,
         last_time: None,
@@ -371,16 +399,33 @@ fn main() {
     // ==========================================
     let x2w_cfg = SyncConfig {
         dir: Direction::X2W,
-        list_types: || read_clipboard("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]),
         pick: pick_x2w,
-        read_data: |t| read_clipboard("xclip", &["-sel", "clip", "-o", "-t", t]),
-        write_data: |t, d| write_clipboard("wl-copy", &["-t", t], d),
+        list: Cmd {
+            program: "xclip",
+            args: &["-selection", "clipboard", "-t", "TARGETS", "-o"],
+            env: Arc::clone(&x_env),
+        },
+        read: Cmd {
+            program: "xclip",
+            args: &["-sel", "clip", "-o", "-t"],
+            env: Arc::clone(&x_env),
+        },
+        write: Cmd {
+            program: "wl-copy",
+            args: &["-t"],
+            env: Arc::clone(&w_env),
+        },
+    };
+    let clipnotify = Cmd {
+        program: "clipnotify",
+        args: &[],
+        env: Arc::clone(&x_env),
     };
     let state_x2w = Arc::clone(&shared_state);
     thread::spawn(move || {
         log("INFO", "=== [X2W] 线程启动 ===");
         loop {
-            let _ = Command::new("clipnotify").status();
+            let _ = clipnotify.command(None).status();
             thread::sleep(Duration::from_millis(30));
             handle_change(&state_x2w, &x2w_cfg);
         }
@@ -394,14 +439,31 @@ fn main() {
     // ==========================================
     let w2x_cfg = SyncConfig {
         dir: Direction::W2X,
-        list_types: || read_clipboard("wl-paste", &["--list-types"]),
         pick: pick_w2x,
-        read_data: |t| read_clipboard("wl-paste", &["-n", "-t", t]),
-        write_data: |t, d| write_clipboard("xclip", &["-sel", "clip", "-i", "-t", t], d),
+        list: Cmd {
+            program: "wl-paste",
+            args: &["--list-types"],
+            env: Arc::clone(&w_env),
+        },
+        read: Cmd {
+            program: "wl-paste",
+            args: &["-n", "-t"],
+            env: Arc::clone(&w_env),
+        },
+        write: Cmd {
+            program: "xclip",
+            args: &["-sel", "clip", "-i", "-t"],
+            env: Arc::clone(&x_env),
+        },
     };
 
-    let mut wl_watch = Command::new("wl-paste")
-        .args(["--watch", "echo"])
+    let watch = Cmd {
+        program: "wl-paste",
+        args: &["--watch", "echo"],
+        env: Arc::clone(&w_env),
+    };
+    let mut wl_watch = watch
+        .command(None)
         .stdout(Stdio::piped())
         .spawn()
         .expect("Failed to start wl-paste --watch");
