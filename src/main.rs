@@ -94,6 +94,9 @@ fn log(level: &str, msg: &str) {
 // 回音窗口阈值：刚被对向写入 1 秒内的变化视为回音，忽略
 const ECHO_WINDOW: Duration = Duration::from_secs(1);
 
+// 事件触发到读取之间的消抖间隔，给剪贴板属主把内容备妥的时间
+const DEBOUNCE: Duration = Duration::from_millis(30);
+
 // 归一化后 Hash：抹平同一内容在两侧的表示差异，供防环去重。
 // Raw（图片等大块数据）直接 Hash 原切片，零分配。
 fn calc_hash(data: &[u8], process_mode: ProcessMode) -> Option<u128> {
@@ -191,27 +194,34 @@ fn rewrite_uri_list(data: &[u8]) -> Vec<u8> {
     res.into_bytes()
 }
 
+// 类型表逐行精确匹配。此前用整串 contains 做子串匹配，靠分支顺序才规避了
+// "text/plain" 误命中 "text/plain;charset=utf-8" 这类前缀重叠，比较脆。
+fn has_type(types: &str, t: &str) -> bool {
+    types.lines().any(|l| l.trim() == t)
+}
+
 // X → Wayland 的类型选择。读取类型是 X 侧的源表示，写入类型是 Wayland 侧目标。
 fn pick_x2w(types: &str) -> Option<(&'static str, &'static str, ProcessMode)> {
-    let plan = if types.contains("x-special/gnome-copied-files") {
+    let has = |t| has_type(types, t);
+    let plan = if has("x-special/gnome-copied-files") {
         (
             "x-special/gnome-copied-files",
             "text/uri-list",
             ProcessMode::UriList,
         )
-    } else if types.contains("application/x-qt-image") || types.contains("text/uri-list") {
+    } else if has("application/x-qt-image") || has("text/uri-list") {
         ("text/uri-list", "text/uri-list", ProcessMode::UriList)
-    } else if types.contains("image/png") {
+    } else if has("image/png") {
         ("image/png", "image/png", ProcessMode::Raw)
-    } else if types.contains("image/jpeg") {
+    } else if has("image/jpeg") {
         ("image/jpeg", "image/jpeg", ProcessMode::Raw)
-    } else if types.contains("text/plain;charset=utf-8") {
+    } else if has("text/plain;charset=utf-8") {
         ("text/plain;charset=utf-8", "text/plain", ProcessMode::Text)
-    } else if types.contains("UTF8_STRING") {
+    } else if has("UTF8_STRING") {
         ("UTF8_STRING", "text/plain", ProcessMode::Text)
-    } else if types.contains("text/plain") {
+    } else if has("text/plain") {
         ("text/plain", "text/plain", ProcessMode::Text)
-    } else if types.contains("text/html") {
+    } else if has("text/html") {
         ("text/html", "text/html", ProcessMode::Raw)
     } else {
         return None;
@@ -221,22 +231,22 @@ fn pick_x2w(types: &str) -> Option<(&'static str, &'static str, ProcessMode)> {
 
 // Wayland → X 的类型选择。读取类型即 Wayland 源类型；写入 xclip 时文本统一用 UTF8_STRING。
 fn pick_w2x(types: &str) -> Option<(&'static str, &'static str, ProcessMode)> {
-    let (read_type, mode) =
-        if types.contains("application/x-qt-image") || types.contains("text/uri-list") {
-            ("text/uri-list", ProcessMode::UriList)
-        } else if types.contains("image/png") {
-            ("image/png", ProcessMode::Raw)
-        } else if types.contains("image/jpeg") {
-            ("image/jpeg", ProcessMode::Raw)
-        } else if types.contains("text/plain;charset=utf-8") {
-            ("text/plain;charset=utf-8", ProcessMode::Text)
-        } else if types.contains("text/plain") {
-            ("text/plain", ProcessMode::Text)
-        } else if types.contains("text/html") {
-            ("text/html", ProcessMode::Raw)
-        } else {
-            return None;
-        };
+    let has = |t| has_type(types, t);
+    let (read_type, mode) = if has("application/x-qt-image") || has("text/uri-list") {
+        ("text/uri-list", ProcessMode::UriList)
+    } else if has("image/png") {
+        ("image/png", ProcessMode::Raw)
+    } else if has("image/jpeg") {
+        ("image/jpeg", ProcessMode::Raw)
+    } else if has("text/plain;charset=utf-8") {
+        ("text/plain;charset=utf-8", ProcessMode::Text)
+    } else if has("text/plain") {
+        ("text/plain", ProcessMode::Text)
+    } else if has("text/html") {
+        ("text/html", ProcessMode::Raw)
+    } else {
+        return None;
+    };
     let write_type = match read_type {
         "text/plain;charset=utf-8" | "text/plain" => "UTF8_STRING",
         other => other,
@@ -429,7 +439,7 @@ fn main() {
                 continue;
             }
             failures = 0;
-            thread::sleep(Duration::from_millis(30));
+            thread::sleep(DEBOUNCE);
             handle_change(&state_x2w, &x2w_cfg);
         }
     });
@@ -475,7 +485,7 @@ fn main() {
     let reader = BufReader::new(stdout);
 
     for _line in reader.lines() {
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(DEBOUNCE);
         handle_change(&shared_state, &w2x_cfg);
     }
 
