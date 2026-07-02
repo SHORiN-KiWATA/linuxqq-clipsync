@@ -409,8 +409,27 @@ fn main() {
     let state_x2w = Arc::clone(&shared_state);
     thread::spawn(move || {
         log("INFO", "=== [X2W] 线程启动 ===");
+        // clipnotify 缺失或 X 断开时 status() 立即失败，若不处理会退化成
+        // 30ms 间隔狂 spawn xclip 的忙等；连续失败则退避并最终退出（交 systemd 重启），
+        // 与 W2X 侧监听死亡即退出的行为对齐。
+        let mut failures = 0u32;
         loop {
-            let _ = clipnotify.command(None).status();
+            let alive = clipnotify
+                .command(None)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !alive {
+                failures += 1;
+                if failures >= 5 {
+                    log("FATAL", "clipnotify 连续失败，触发退出...");
+                    std::process::exit(1);
+                }
+                log("WARN", &format!("clipnotify 失败 ({failures}/5)，退避 1s"));
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            failures = 0;
             thread::sleep(Duration::from_millis(30));
             handle_change(&state_x2w, &x2w_cfg);
         }
