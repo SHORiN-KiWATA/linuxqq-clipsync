@@ -3,6 +3,7 @@ use memfd::MemfdOptions;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -289,6 +290,22 @@ fn handle_change(state: &Mutex<SyncState>, cfg: &SyncConfig) {
     }
 }
 
+// 扫描 dir 下的候选套接字文件，返回第一个能真正建立连接的 display 名。
+// 直接 connect 探活：此前用子进程 output().is_ok() 只能证明命令启动成功，
+// 连不上服务器与剪贴板为空同样非零退出，无法区分，探测形同虚设。
+fn probe_display(dir: &str, to_display: impl Fn(&str) -> Option<String>) -> Option<String> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let file_name = entry.file_name().into_string().unwrap_or_default();
+        let Some(display) = to_display(&file_name) else {
+            continue;
+        };
+        if UnixStream::connect(entry.path()).is_ok() {
+            return Some(display);
+        }
+    }
+    None
+}
+
 fn get_xdg_runtime_dir() -> String {
     if let Ok(dir) = env::var("XDG_RUNTIME_DIR") {
         return dir;
@@ -313,42 +330,17 @@ fn main() {
     let mut display = env::var("DISPLAY").unwrap_or_default();
 
     if wayland_display.is_empty() {
-        if let Ok(entries) = fs::read_dir(&xdg_runtime_dir) {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name().into_string().unwrap_or_default();
-                if file_name.starts_with("wayland-")
-                    && !file_name.contains('.')
-                    && Command::new("wl-paste")
-                        .env("WAYLAND_DISPLAY", &file_name)
-                        .arg("--list-types")
-                        .output()
-                        .is_ok()
-                {
-                    wayland_display = file_name;
-                    break;
-                }
-            }
-        }
+        wayland_display = probe_display(&xdg_runtime_dir, |f| {
+            (f.starts_with("wayland-") && !f.contains('.')).then(|| f.to_string())
+        })
+        .unwrap_or_default();
     }
 
     if display.is_empty() {
-        if let Ok(entries) = fs::read_dir("/tmp/.X11-unix") {
-            for entry in entries.flatten() {
-                let file_name = entry.file_name().into_string().unwrap_or_default();
-                if let Some(stripped) = file_name.strip_prefix('X') {
-                    let test_d = format!(":{}", stripped);
-                    if Command::new("xclip")
-                        .env("DISPLAY", &test_d)
-                        .args(["-selection", "clipboard", "-t", "TARGETS", "-o"])
-                        .output()
-                        .is_ok()
-                    {
-                        display = test_d;
-                        break;
-                    }
-                }
-            }
-        }
+        display = probe_display("/tmp/.X11-unix", |f| {
+            f.strip_prefix('X').map(|n| format!(":{n}"))
+        })
+        .unwrap_or_default();
     }
 
     env::set_var("WAYLAND_DISPLAY", &wayland_display);
